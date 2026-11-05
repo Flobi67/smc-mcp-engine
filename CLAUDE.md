@@ -4,8 +4,16 @@ Moteur déterministe de Smart Money Concepts (SMC) et de microstructure de march
 (FVG, Order Blocks, BOS/CHoCH, Liquidity Pools), exposé via un serveur MCP
 (Model Context Protocol) natif.
 
-Le dépôt ne contient pas encore de code : pas de langage, de dépendances, de
-tests ni de linter choisis. Mettre à jour ce fichier dès que ces choix sont faits.
+## Code
+
+- Langage : Python. Dépendances : pandas, numpy, requests (`backtester/requirements.txt`).
+  Tests : pytest (`python -m pytest backtester`), sur données synthétiques.
+- `backtester/smc_backtester.py` : backtests V1 à V4. Les fonctions `backtest_*` sont
+  pures : DataFrames en entrée, dict en sortie, aucun appel réseau ni horloge. Seule la
+  commande `download` utilise le réseau ; `run` lit des CSV locaux
+  (`backtester/data/`, ignoré par git sauf les `.sha256`) dont l'empreinte SHA-256 est
+  vérifiée par `load_klines`.
+- Pas encore de linter choisi.
 
 ## Préférences
 
