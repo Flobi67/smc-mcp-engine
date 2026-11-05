@@ -17,33 +17,24 @@ Corrections par rapport à la version précédente :
   - V2 : fenêtre future non tronquée à 18h, session asiatique complète exigée
   - V4 : ajout des shorts, RR paramétrable (2.0 par défaut, comme V1/V2)
   - Gestion des erreurs réseau avec nouvelles tentatives
+
+Architecture : les fonctions backtest_* sont pures (DataFrames en entrée, dict en
+sortie, aucun appel réseau ni horloge). Seule la commande `download` utilise le
+réseau ; `run` lit des CSV locaux dont l'empreinte SHA-256 est vérifiée.
+
+  python smc_backtester.py download --start 2025-01-01 --end 2025-11-01 --data-dir data
+  python smc_backtester.py run      --start 2025-01-01 --end 2025-11-01 --data-dir data
 """
 
+import argparse
+import hashlib
+import json
 import sys
 import time
-import json
-import subprocess
-import importlib
+from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# 0. Gestion automatique des dépendances
-# ---------------------------------------------------------------------------
-REQUIRED_PACKAGES = ["pandas", "numpy", "requests"]
-
-
-def ensure_dependencies():
-    for pkg in REQUIRED_PACKAGES:
-        try:
-            importlib.import_module(pkg)
-        except ImportError:
-            print(f"[INIT] Paquet '{pkg}' manquant. Installation en cours...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
-
-ensure_dependencies()
-
-import pandas as pd
 import numpy as np
+import pandas as pd
 import requests
 
 # ---------------------------------------------------------------------------
@@ -55,8 +46,8 @@ MIN_RISK_PCT = 0.0015    # risque minimum (0,15 % du prix) : sinon les frais man
 HORIZON = 48             # durée max d'un trade, en bougies
 RR = 2.0                 # ratio risque/rendement par défaut
 
-LIMIT_1H = 8760          # ~ 1 an de bougies 1h
-LIMIT_15M = 35000        # ~ 1 an de bougies 15m
+DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "NEARUSDT"]
+INTERVAL_MS = {"15m": 15 * 60_000, "1h": 60 * 60_000}
 
 BINANCE_FUTURES_URL = "https://fapi.binance.com/fapi/v1/klines"
 MAX_PER_REQUEST = 1500
@@ -84,29 +75,20 @@ def _get_with_retry(params: dict, retries: int = 3) -> list:
     raise RuntimeError(f"Échec de récupération des klines : {last_err}")
 
 
-def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
-    """Récupère `limit` bougies clôturées en remontant dans le temps par pages de 1500."""
-    chunks = []
-    remaining = limit
-    end_time = None
-    while remaining > 0:
-        page = min(MAX_PER_REQUEST, remaining)
-        params = {"symbol": symbol, "interval": interval, "limit": page}
-        if end_time is not None:
-            params["endTime"] = end_time
-        raw = _get_with_retry(params)
+def download_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Télécharge les bougies [start_ms, end_ms) en avançant dans le temps (réseau)."""
+    rows = []
+    cursor = start_ms
+    while cursor < end_ms:
+        raw = _get_with_retry({"symbol": symbol, "interval": interval, "limit": MAX_PER_REQUEST,
+                               "startTime": cursor, "endTime": end_ms - 1})
         if not raw:
             break
-        chunks.append(raw)
-        remaining -= len(raw)
-        end_time = raw[0][0] - 1
-        if len(raw) < page:
+        rows.extend(raw)
+        cursor = raw[-1][0] + INTERVAL_MS[interval]
+        if len(raw) < MAX_PER_REQUEST:
             break
         time.sleep(0.1)
-
-    rows = [r for chunk in reversed(chunks) for r in chunk]
-    now_ms = int(time.time() * 1000)
-    rows = [r for r in rows if r[6] < now_ms]  # retire la bougie en cours
 
     cols = ['open_time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'quote_volume', 'count', 'taker_buy_vol',
@@ -118,6 +100,44 @@ def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000) -
     for c in ['open', 'high', 'low', 'close', 'volume']:
         df[c] = df[c].astype(float)
     return df[['open', 'high', 'low', 'close', 'volume']]
+
+
+# ---------------------------------------------------------------------------
+# Stockage local : CSV + empreinte SHA-256
+# ---------------------------------------------------------------------------
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _sha_path(path: Path) -> Path:
+    return Path(str(path) + ".sha256")
+
+
+def save_klines(df: pd.DataFrame, path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, float_format="%.10g")
+    _sha_path(path).write_text(_sha256(path) + "\n")
+
+
+def load_klines(path) -> pd.DataFrame:
+    """Charge un CSV de bougies ; refuse le fichier si son empreinte SHA-256 ne correspond pas."""
+    path = Path(path)
+    sha_file = _sha_path(path)
+    if not sha_file.exists():
+        raise ValueError(f"Empreinte manquante : {sha_file}")
+    expected = sha_file.read_text().split()[0]
+    actual = _sha256(path)
+    if actual != expected:
+        raise ValueError(f"Empreinte SHA-256 invalide pour {path} (attendu {expected}, obtenu {actual})")
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    df.index = pd.to_datetime(df.index, utc=True)
+    df.index.name = "timestamp"
+    return df.astype(float)
+
+
+def klines_path(data_dir, symbol: str, interval: str, start: str, end: str) -> Path:
+    return Path(data_dir) / f"{symbol}_{interval}_{start}_{end}.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +234,8 @@ def _period(df: pd.DataFrame) -> str:
 # ---------------------------------------------------------------------------
 # V1 : Sweeps de liquidité journaliers (PDH / PDL)
 # ---------------------------------------------------------------------------
-def backtest_v1_daily_sweep(symbol: str = "BTCUSDT", limit: int = LIMIT_1H) -> dict:
-    df = fetch_binance_klines(symbol, interval="1h", limit=limit)
+def backtest_v1_daily_sweep(df: pd.DataFrame, symbol: str = "BTCUSDT") -> dict:
+    """df : bougies 1h (open/high/low/close/volume, index UTC)."""
     daily = df.resample('1D').agg({'high': 'max', 'low': 'min'})
     daily['PDH'] = daily['high'].shift(1)
     daily['PDL'] = daily['low'].shift(1)
@@ -245,8 +265,9 @@ def backtest_v1_daily_sweep(symbol: str = "BTCUSDT", limit: int = LIMIT_1H) -> d
 # ---------------------------------------------------------------------------
 # V2 : Sweeps intraday (range de la session asiatique, heures UTC)
 # ---------------------------------------------------------------------------
-def backtest_v2_session_sweep(symbol: str = "ETHUSDT", limit: int = LIMIT_15M) -> dict:
-    df = fetch_binance_klines(symbol, interval="15m", limit=limit)
+def backtest_v2_session_sweep(df: pd.DataFrame, symbol: str = "ETHUSDT") -> dict:
+    """df : bougies 15m (open/high/low/close/volume, index UTC)."""
+    df = df.copy()
     df['hour'] = df.index.hour
     df['date'] = df.index.date
 
@@ -284,14 +305,14 @@ def backtest_v2_session_sweep(symbol: str = "ETHUSDT", limit: int = LIMIT_15M) -
 # ---------------------------------------------------------------------------
 # V3 : Scanner multi-actifs (V1 + V2 sur chaque symbole)
 # ---------------------------------------------------------------------------
-def backtest_v3_screener(symbols=None) -> dict:
-    symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "NEARUSDT"]
+def backtest_v3_screener(data: dict) -> dict:
+    """data : {symbole: {"1h": DataFrame, "15m": DataFrame}}."""
     results = {}
-    for s in symbols:
+    for s in sorted(data):
         try:
             results[s] = {
-                "V1": backtest_v1_daily_sweep(s)['metrics'],
-                "V2": backtest_v2_session_sweep(s)['metrics'],
+                "V1": backtest_v1_daily_sweep(data[s]["1h"], s)['metrics'],
+                "V2": backtest_v2_session_sweep(data[s]["15m"], s)['metrics'],
             }
         except Exception as e:
             results[s] = {"error": str(e)}
@@ -307,11 +328,10 @@ def detect_fvg(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def backtest_v4_advanced_smc(symbol_leader: str = "BTCUSDT", symbol_lag: str = "ETHUSDT",
-                             limit: int = LIMIT_1H, rr: float = RR, lookback: int = 24) -> dict:
-    lead = fetch_binance_klines(symbol_leader, interval="1h", limit=limit)
-    lag = fetch_binance_klines(symbol_lag, interval="1h", limit=limit)
-
+def backtest_v4_advanced_smc(lead: pd.DataFrame, lag: pd.DataFrame,
+                             symbol_leader: str = "BTCUSDT", symbol_lag: str = "ETHUSDT",
+                             rr: float = RR, lookback: int = 24) -> dict:
+    """lead / lag : bougies 1h du leader et du suiveur."""
     idx = lead.index.intersection(lag.index)
     lead = lead.loc[idx].copy()
     lag = detect_fvg(lag.loc[idx].copy())
@@ -347,25 +367,57 @@ def backtest_v4_advanced_smc(symbol_leader: str = "BTCUSDT", symbol_lag: str = "
 
 
 # ---------------------------------------------------------------------------
-# Exécution du pipeline global
+# Ligne de commande (seul `download` utilise le réseau)
 # ---------------------------------------------------------------------------
-def _show(title: str, fn, *args, **kwargs):
-    print(f"\n--- [{title}] ---")
-    try:
-        print(json.dumps(fn(*args, **kwargs), indent=2, default=str))
-    except Exception as e:
-        print(f"[ERREUR] {e}")
+def _to_ms(day: str) -> int:
+    return int(pd.Timestamp(day, tz="UTC").timestamp() * 1000)
 
 
-if __name__ == "__main__":
+def cmd_download(args) -> None:
+    for sym in args.symbols:
+        for interval in ("1h", "15m"):
+            df = download_klines(sym, interval, _to_ms(args.start), _to_ms(args.end))
+            path = klines_path(args.data_dir, sym, interval, args.start, args.end)
+            save_klines(df, path)
+            print(f"[DOWNLOAD] {path} ({len(df)} bougies)")
+
+
+def cmd_run(args) -> None:
+    def load(sym, interval):
+        return load_klines(klines_path(args.data_dir, sym, interval, args.start, args.end))
+
     print("=" * 60)
-    print("PIPELINE DE BACKTEST MULTI-STAGE SMC")
     print(f"Frais {FEE_RATE*100:.2f}% + slippage {SLIPPAGE*100:.2f}% par côté | "
           f"RR {RR} | horizon {HORIZON} bougies")
     print("=" * 60)
 
-    _show("Étape 1 : V1 Daily Sweep - NEAR", backtest_v1_daily_sweep, "NEARUSDT")
-    _show("Étape 2 : V2 Intraday Session Sweep - ETH", backtest_v2_session_sweep, "ETHUSDT")
-    _show("Étape 3 : V3 Multi-Asset Screener", backtest_v3_screener)
-    _show("Étape 4 : V4 SMT + FVG - BTC/ETH", backtest_v4_advanced_smc, "BTCUSDT", "ETHUSDT")
-    print("=" * 60)
+    def show(title, fn):
+        print(f"\n--- [{title}] ---")
+        try:
+            print(json.dumps(fn(), indent=2, default=str))
+        except Exception as e:
+            print(f"[ERREUR] {e}")
+
+    show("V1 Daily Sweep - NEAR", lambda: backtest_v1_daily_sweep(load("NEARUSDT", "1h"), "NEARUSDT"))
+    show("V2 Intraday Session Sweep - ETH", lambda: backtest_v2_session_sweep(load("ETHUSDT", "15m"), "ETHUSDT"))
+    show("V3 Multi-Asset Screener", lambda: backtest_v3_screener(
+        {s: {"1h": load(s, "1h"), "15m": load(s, "15m")} for s in args.symbols}))
+    show("V4 SMT + FVG - BTC/ETH", lambda: backtest_v4_advanced_smc(load("BTCUSDT", "1h"), load("ETHUSDT", "1h")))
+
+
+def main(argv=None) -> None:
+    p = argparse.ArgumentParser(description="SMC multi-stage backtester")
+    sub = p.add_subparsers(dest="command", required=True)
+    for name, fn in (("download", cmd_download), ("run", cmd_run)):
+        sp = sub.add_parser(name)
+        sp.add_argument("--start", required=True, help="YYYY-MM-DD (UTC, inclus)")
+        sp.add_argument("--end", required=True, help="YYYY-MM-DD (UTC, exclu)")
+        sp.add_argument("--data-dir", default="data")
+        sp.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
+        sp.set_defaults(func=fn)
+    args = p.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
