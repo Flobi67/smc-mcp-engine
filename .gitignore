@@ -1,0 +1,4 @@
+__pycache__/
+.pytest_cache/
+backtester/data/*
+!backtester/data/*.sha256
